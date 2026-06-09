@@ -48,6 +48,8 @@ INITIAL_CAPITAL = 100000.0
 EPSILON = 1e-9
 BACKUP_DIR = SERVER_DIR / "data" / "repair_backups"
 US_STOCK_PLACEHOLDER_SYMBOLS = {"PORTFOLIO", "STRATEGY"}
+US_STOCK_OUTLIER_RATIO = 2.0
+US_STOCK_OUTLIER_MIN_IMPACT = 5000.0
 
 
 def normalized_market(value: Any) -> str:
@@ -138,8 +140,8 @@ def suspicious_reasons(signal: dict[str, Any]) -> list[str]:
         and symbol not in US_STOCK_PLACEHOLDER_SYMBOLS
         and entry_price > EPSILON
         and position_current_price > EPSILON
-        and position_current_price / entry_price >= 20.0
-        and abs(position_current_price - entry_price) * quantity >= 5000.0
+        and position_current_price / entry_price >= US_STOCK_OUTLIER_RATIO
+        and abs(position_current_price - entry_price) * quantity >= US_STOCK_OUTLIER_MIN_IMPACT
     ):
         reasons.append("us_stock_entry_price_outlier")
     return reasons
@@ -191,12 +193,13 @@ def load_suspicious_operation_signals(cursor: Any) -> list[dict[str, Any]]:
                 AND UPPER(s.symbol) NOT IN ('PORTFOLIO', 'STRATEGY')
                 AND s.entry_price > 0
                 AND ppr.current_price IS NOT NULL
-                AND ppr.current_price / s.entry_price >= 20.0
-                AND ABS(ppr.current_price - s.entry_price) * COALESCE(s.quantity, 0) >= 5000.0
+                AND ppr.current_price / s.entry_price >= ?
+                AND ABS(ppr.current_price - s.entry_price) * COALESCE(s.quantity, 0) >= ?
             )
           )
         ORDER BY a.name, COALESCE(s.executed_at, s.created_at), s.id
         """,
+        (US_STOCK_OUTLIER_RATIO, US_STOCK_OUTLIER_MIN_IMPACT),
     )
     for row in rows:
         row["suspicious_reasons"] = suspicious_reasons(row)

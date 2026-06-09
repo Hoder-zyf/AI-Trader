@@ -89,17 +89,18 @@ class ChallengeTests(unittest.TestCase):
         quantity: float,
         symbol: str = "BTC",
     ):
-        return create_challenge_trade(
-            challenge_key,
-            agent_id=agent_id,
-            data={
-                "symbol": symbol,
-                "side": side,
-                "price": price,
-                "quantity": quantity,
-                "executed_at": iso(datetime.now(timezone.utc)),
-            },
-        )
+        with patch("price_fetcher.get_price_from_market", return_value=price):
+            return create_challenge_trade(
+                challenge_key,
+                agent_id=agent_id,
+                data={
+                    "symbol": symbol,
+                    "side": side,
+                    "price": price,
+                    "quantity": quantity,
+                    "executed_at": iso(datetime.now(timezone.utc)),
+                },
+            )
 
     def test_create_and_join_challenge_is_idempotent(self):
         challenge = self._create_active_challenge(challenge_key="join-check")
@@ -147,9 +148,21 @@ class ChallengeTests(unittest.TestCase):
         challenge = self._create_active_challenge(challenge_key="dedicated-trade")
         join_challenge(challenge["challenge_key"], self.agent_2)
 
-        result = self._submit_challenge_trade(challenge["challenge_key"], self.agent_2, "buy", 100.0, 2.0)
+        with patch("price_fetcher.get_price_from_market", return_value=100.0):
+            result = create_challenge_trade(
+                challenge["challenge_key"],
+                agent_id=self.agent_2,
+                data={
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "price": 1.0,
+                    "quantity": 2.0,
+                    "executed_at": iso(datetime.now(timezone.utc)),
+                },
+            )
 
         self.assertIsNone(result["trade"]["source_signal_id"])
+        self.assertEqual(result["trade"]["price"], 100.0)
         self.assertEqual(result["portfolio"]["trade_count"], 1)
         self.assertAlmostEqual(result["portfolio"]["cash"], 800.0)
         self.assertEqual(result["portfolio"]["positions"][0]["quantity"], 2.0)
@@ -170,6 +183,30 @@ class ChallengeTests(unittest.TestCase):
 
         portfolio = get_agent_challenge_portfolio(challenge["challenge_key"], self.agent_2)
         self.assertEqual(portfolio["portfolio"]["trade_count"], 1)
+
+    def test_dedicated_challenge_trade_requires_server_price(self):
+        challenge = self._create_active_challenge(challenge_key="dedicated-trade-no-price")
+        join_challenge(challenge["challenge_key"], self.agent_2)
+
+        with patch("price_fetcher.get_price_from_market", return_value=None):
+            with self.assertRaises(ChallengeError):
+                create_challenge_trade(
+                    challenge["challenge_key"],
+                    agent_id=self.agent_2,
+                    data={
+                        "symbol": "BTC",
+                        "side": "buy",
+                        "price": 1.0,
+                        "quantity": 2.0,
+                        "executed_at": iso(datetime.now(timezone.utc)),
+                    },
+                )
+
+        conn = database.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS count FROM challenge_trades WHERE challenge_id = ?", (challenge["id"],))
+        self.assertEqual(cursor.fetchone()["count"], 0)
+        conn.close()
 
     def test_active_leaderboard_marks_open_positions_to_market(self):
         challenge = self._create_active_challenge(challenge_key="live-mark-leaderboard")

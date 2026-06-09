@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -80,6 +81,97 @@ class AgentLoginTokenStabilityTests(unittest.TestCase):
         cursor = conn.cursor()
         cursor.execute("SELECT email FROM agents WHERE name = ?", ("email-agent",))
         self.assertEqual(cursor.fetchone()["email"], "trader@example.com")
+        conn.close()
+
+    def test_registration_tracks_extra_initial_cash_as_deposit(self) -> None:
+        register = self.client.post(
+            "/api/claw/agents/selfRegister",
+            json={
+                "name": "funded-agent",
+                "password": "password123",
+                "initial_balance": 150000,
+            },
+        )
+        self.assertEqual(register.status_code, 200, register.text)
+        self.assertEqual(register.json()["deposited"], 50000.0)
+
+        conn = database.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT cash, deposited FROM agents WHERE name = ?", ("funded-agent",))
+        row = cursor.fetchone()
+        conn.close()
+
+        self.assertEqual(float(row["cash"]), 150000.0)
+        self.assertEqual(float(row["deposited"]), 50000.0)
+
+    def test_registration_marks_initial_positions_to_server_quote(self) -> None:
+        with patch("price_fetcher.get_price_from_market", return_value=250.0):
+            register = self.client.post(
+                "/api/claw/agents/selfRegister",
+                json={
+                    "name": "position-agent",
+                    "password": "password123",
+                    "initial_balance": 100000,
+                    "positions": [
+                        {
+                            "market": "us-stock",
+                            "symbol": "tsla",
+                            "side": "long",
+                            "quantity": 2,
+                            "entry_price": 1,
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(register.status_code, 200, register.text)
+        self.assertEqual(register.json()["deposited"], 500.0)
+
+        conn = database.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, cash, deposited FROM agents WHERE name = ?", ("position-agent",))
+        agent = cursor.fetchone()
+        cursor.execute(
+            "SELECT symbol, market, quantity, entry_price, current_price FROM positions WHERE agent_id = ?",
+            (agent["id"],),
+        )
+        position = cursor.fetchone()
+        conn.close()
+
+        self.assertEqual(float(agent["cash"]), 100000.0)
+        self.assertEqual(float(agent["deposited"]), 500.0)
+        self.assertEqual(position["symbol"], "TSLA")
+        self.assertEqual(position["market"], "us-stock")
+        self.assertEqual(float(position["quantity"]), 2.0)
+        self.assertEqual(float(position["entry_price"]), 250.0)
+        self.assertEqual(float(position["current_price"]), 250.0)
+
+    def test_registration_rejects_initial_position_without_server_quote(self) -> None:
+        with patch("price_fetcher.get_price_from_market", return_value=None):
+            register = self.client.post(
+                "/api/claw/agents/selfRegister",
+                json={
+                    "name": "bad-position-agent",
+                    "password": "password123",
+                    "positions": [
+                        {
+                            "market": "us-stock",
+                            "symbol": "tsla",
+                            "side": "long",
+                            "quantity": 2,
+                            "entry_price": 1,
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(register.status_code, 400, register.text)
+        self.assertIn("Unable to fetch current price for TSLA", register.json()["detail"])
+
+        conn = database.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS count FROM agents WHERE name = ?", ("bad-position-agent",))
+        self.assertEqual(int(cursor.fetchone()["count"]), 0)
         conn.close()
 
     def test_agent_identity_defaults_normal_and_can_be_verified_manually(self) -> None:

@@ -27,6 +27,7 @@ class ChallengeNotFound(ChallengeError):
 DEFAULT_CHALLENGE_REWARDS = {'1': 100, '2': 50, '3': 25}
 SUPPORTED_SCORING_METHODS = {'return-only', 'risk-adjusted'}
 SUPPORTED_CHALLENGE_TRACKS = {'crypto', 'us-stock', 'polymarket'}
+AUTHORITATIVE_CHALLENGE_PRICE_MARKETS = {'crypto', 'us-stock'}
 
 
 def _row_dict(row: Any) -> dict[str, Any]:
@@ -124,6 +125,31 @@ def _fetch_live_mark_prices(scored_results: list[dict[str, Any]], mark_timestamp
             if math.isfinite(parsed) and parsed > 0:
                 mark_prices[(market, symbol)] = parsed
     return mark_prices
+
+
+def _fetch_authoritative_challenge_trade_price(market: str, symbol: str, executed_at: str) -> Optional[float]:
+    if market not in AUTHORITATIVE_CHALLENGE_PRICE_MARKETS:
+        return None
+
+    try:
+        import price_fetcher
+        from price_fetcher import price_fetch_logging
+    except Exception as exc:
+        raise ChallengeError('Server price fetcher is unavailable') from exc
+
+    with price_fetch_logging(False):
+        try:
+            price = price_fetcher.get_price_from_market(symbol, executed_at, market)
+        except Exception as exc:
+            raise ChallengeError(f'Unable to fetch server price for {symbol}') from exc
+
+    try:
+        parsed = float(price) if price is not None else 0.0
+    except Exception:
+        parsed = 0.0
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ChallengeError(f'Unable to fetch server price for {symbol}')
+    return parsed
 
 
 def _score_challenge_results_with_live_marks(
@@ -743,6 +769,10 @@ def create_challenge_trade(challenge_key: str, agent_id: int, data: Any) -> dict
             raise ChallengeError('Challenge participant is not tradeable')
 
         symbol = _normalize_challenge_trade_symbol(challenge, payload.get('symbol'))
+        requested_price = price
+        server_price = _fetch_authoritative_challenge_trade_price(challenge['market'], symbol, executed_at)
+        if server_price is not None:
+            price = server_price
         cursor.execute(
             """
             SELECT *
@@ -813,6 +843,7 @@ def create_challenge_trade(challenge_key: str, agent_id: int, data: Any) -> dict
                 'symbol': symbol,
                 'side': side,
                 'price': price,
+                'requested_price': requested_price,
                 'quantity': quantity,
             },
             cursor=cursor,

@@ -1,4 +1,5 @@
 import json
+import math
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +33,7 @@ from routes_shared import (
     invalidate_agent_message_caches,
     push_agent_message,
     set_short_cached_payload,
+    should_fetch_server_trade_price,
     utc_now_iso_z,
     validate_market,
 )
@@ -53,6 +55,8 @@ from utils import (
     verify_password,
 )
 
+
+INITIAL_CAPITAL = 100000.0
 
 DISCUSSION_NOTIFICATION_TYPES = (
     'discussion_started',
@@ -567,21 +571,24 @@ def register_agent_routes(app: FastAPI, ctx: RouteContext) -> None:
             password_hash = hash_password(data.password)
             wallet = validate_address(data.wallet_address) if data.wallet_address else ''
             email = str(data.email).strip().lower() if data.email else None
+            try:
+                initial_cash = float(data.initial_balance)
+            except Exception:
+                raise HTTPException(status_code=400, detail='Invalid initial balance')
 
-            cursor.execute(
-                """
-                INSERT INTO agents (name, email, password_hash, wallet_address, cash)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (agent_name, email, password_hash, wallet, data.initial_balance),
-            )
-
-            agent_id = cursor.lastrowid
-            token = secrets.token_urlsafe(32)
-            cursor.execute('UPDATE agents SET token = ? WHERE id = ?', (token, agent_id))
+            if not math.isfinite(initial_cash) or initial_cash < 0:
+                raise HTTPException(status_code=400, detail='Invalid initial balance')
 
             now = utc_now_iso_z()
+            initial_positions: list[dict] = []
+            initial_position_value = 0.0
             if data.positions:
+                get_price_from_market = None
+                if any(should_fetch_server_trade_price(pos.get('market', 'us-stock')) for pos in data.positions):
+                    from price_fetcher import get_price_from_market as _get_price_from_market
+
+                    get_price_from_market = _get_price_from_market
+
                 for pos in data.positions:
                     market = validate_market(pos.get('market', 'us-stock'))
                     symbol = str(pos.get('symbol') or '').strip()
@@ -589,18 +596,86 @@ def register_agent_routes(app: FastAPI, ctx: RouteContext) -> None:
                         raise HTTPException(status_code=400, detail='Position symbol is required')
                     if market != 'polymarket':
                         symbol = symbol.upper()
+
+                    side = str(pos.get('side') or 'long').strip().lower()
+                    if side not in {'long', 'short'}:
+                        raise HTTPException(status_code=400, detail='Position side must be long or short')
+
+                    try:
+                        quantity = float(pos.get('quantity', 0))
+                    except Exception:
+                        raise HTTPException(status_code=400, detail='Invalid position quantity')
+                    if not math.isfinite(quantity) or quantity <= 0:
+                        raise HTTPException(status_code=400, detail='Invalid position quantity')
+
+                    token_id = str(pos.get('token_id') or '').strip() or None
+                    outcome = str(pos.get('outcome') or '').strip() or None
+
+                    if should_fetch_server_trade_price(market):
+                        server_price = get_price_from_market(
+                            symbol,
+                            now,
+                            market,
+                            token_id=token_id,
+                            outcome=outcome,
+                        ) if get_price_from_market else None
+                        if not server_price:
+                            raise HTTPException(status_code=400, detail=f'Unable to fetch current price for {symbol}')
+                        entry_price = float(server_price)
+                    else:
+                        try:
+                            entry_price = float(pos.get('entry_price', 0))
+                        except Exception:
+                            raise HTTPException(status_code=400, detail='Invalid position entry price')
+
+                    if not math.isfinite(entry_price) or entry_price <= 0:
+                        raise HTTPException(status_code=400, detail='Invalid position entry price')
+
+                    initial_position_value += entry_price * abs(quantity)
+                    initial_positions.append({
+                        'market': market,
+                        'symbol': symbol,
+                        'token_id': token_id,
+                        'outcome': outcome,
+                        'side': side,
+                        'quantity': quantity,
+                        'entry_price': entry_price,
+                    })
+
+            deposited = max(0.0, initial_cash + initial_position_value - INITIAL_CAPITAL)
+
+            cursor.execute(
+                """
+                INSERT INTO agents (name, email, password_hash, wallet_address, cash, deposited)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (agent_name, email, password_hash, wallet, initial_cash, deposited),
+            )
+
+            agent_id = cursor.lastrowid
+            token = secrets.token_urlsafe(32)
+            cursor.execute('UPDATE agents SET token = ? WHERE id = ?', (token, agent_id))
+
+            if initial_positions:
+                for pos in initial_positions:
                     cursor.execute(
                         """
-                        INSERT INTO positions (agent_id, symbol, market, side, quantity, entry_price, opened_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO positions (
+                            agent_id, symbol, market, token_id, outcome,
+                            side, quantity, entry_price, current_price, opened_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             agent_id,
-                            symbol,
-                            market,
-                            pos.get('side', 'long'),
-                            pos.get('quantity', 0),
-                            pos.get('entry_price', 0),
+                            pos['symbol'],
+                            pos['market'],
+                            pos['token_id'],
+                            pos['outcome'],
+                            pos['side'],
+                            pos['quantity'],
+                            pos['entry_price'],
+                            pos['entry_price'],
                             now,
                         ),
                     )
@@ -609,7 +684,12 @@ def register_agent_routes(app: FastAPI, ctx: RouteContext) -> None:
                 actor_agent_id=agent_id,
                 object_type='agent',
                 object_id=agent_id,
-                metadata={'name': agent_name, 'initial_balance': data.initial_balance, 'position_count': len(data.positions or [])},
+                metadata={
+                    'name': agent_name,
+                    'initial_balance': initial_cash,
+                    'deposited': deposited,
+                    'position_count': len(initial_positions),
+                },
                 cursor=cursor,
             )
 
@@ -633,7 +713,8 @@ def register_agent_routes(app: FastAPI, ctx: RouteContext) -> None:
                 'email': email,
                 'identity_status': 'normal',
                 'is_verified': False,
-                'initial_balance': data.initial_balance,
+                'initial_balance': initial_cash,
+                'deposited': deposited,
                 'experiment_assignments': experiment_assignments,
             }
         except HTTPException:

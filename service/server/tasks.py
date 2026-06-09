@@ -473,7 +473,7 @@ async def update_position_prices():
     # Get max parallel requests from environment variable
     max_parallel = _env_int("MAX_PARALLEL_PRICE_FETCH", 2, minimum=1)
     verbose_fetch = _env_bool("POSITION_PRICE_VERBOSE_FETCH_LOGS", False)
-    refresh_priced_markets = _env_csv_set("POSITION_PRICE_REFRESH_PRICED_MARKETS", "crypto")
+    refresh_priced_markets = _env_csv_set("POSITION_PRICE_REFRESH_PRICED_MARKETS", "crypto,us-stock")
 
     # Wait a bit on startup before first update
     await asyncio.sleep(_env_int("POSITION_PRICE_STARTUP_DELAY_SECONDS", 15, minimum=0))
